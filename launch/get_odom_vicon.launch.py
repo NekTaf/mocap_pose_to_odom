@@ -14,10 +14,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         
-        DeclareLaunchArgument('pose_buffer_n',
-                            description='Number of poses to keep in buffer', 
-                            default_value="10"),
-
         IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(
                         [FindPackageShare('mocap4r2_vicon_driver'), '/launch/mocap4r2_vicon_driver_launch.py']
@@ -25,7 +21,12 @@ def generate_launch_description():
                 ),        
         
         TimerAction(period=3.0,actions=[ExecuteProcess(
-            cmd=['ros2', 'lifecycle', 'set', '/mocap4r2_vicon_driver_node', 'activate'],
+            cmd=[
+                'ros2', 
+                'lifecycle', 
+                'set', 
+                '/mocap4r2_vicon_driver_node',
+                'activate'],
             output='screen'
         )]),
                 
@@ -34,7 +35,6 @@ def generate_launch_description():
             executable='mocap_pose_to_odom', 
             name='mocap_pose_to_odom',
             output='screen',
-            arguments=[LaunchConfiguration('pose_buffer_n')],
         )
     
     ])

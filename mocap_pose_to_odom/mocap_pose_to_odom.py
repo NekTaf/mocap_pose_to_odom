@@ -8,10 +8,7 @@ from scipy.spatial.transform import Rotation as R
 from mocap4r2_msgs.msg import RigidBodies
 import argparse
 
-parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument('pose_buffer_n', default=10, type=int)
-known_args, _ = parser.parse_known_args()
-pose_buffer_n_arg = known_args.pose_buffer_n
+from .config import MocapCfg
 
 def safe_quat(q):
     q = np.array(q, dtype=float)
@@ -22,14 +19,23 @@ def safe_quat(q):
         return None
     return q / n
 
-
 class MocapPoseToOdom(Node):
     def __init__(self):
         super().__init__('mocap_to_odom')
-        self.sub = self.create_subscription(RigidBodies, 'rigid_bodies', self.callback, 10)
-        self.pub = self.create_publisher(Odometry, 'odom', 10)
+        self.sub = self.create_subscription(
+            RigidBodies, 
+            'rigid_bodies',
+            self.callback,
+            10
+            )
+        
+        self.pub = self.create_publisher(
+            Odometry, 
+            'odom', 
+            10
+        )
 
-        self.pose_buffer = deque(maxlen=pose_buffer_n_arg)  
+        self.pose_buffer = deque(maxlen=MocapCfg.pose_buffer_n_arg)  
 
     def callback(self, msg: RigidBodies):
         self.pose_buffer.append(msg)
@@ -41,6 +47,7 @@ class MocapPoseToOdom(Node):
 
         dt = (last.header.stamp.sec - first.header.stamp.sec) + \
              (last.header.stamp.nanosec - first.header.stamp.nanosec) * 1e-9
+        
         if dt <= 0.0:
             return
 
@@ -90,7 +97,7 @@ class MocapPoseToOdom(Node):
         
         odom = Odometry()
         odom.header = msg.header
-        odom.header.frame_id = 'odom'
+        odom.header.frame_id = MocapCfg.frame
         odom.child_frame_id = 'base_link'
         odom.pose.pose = msg.rigidbodies[0].pose
 
