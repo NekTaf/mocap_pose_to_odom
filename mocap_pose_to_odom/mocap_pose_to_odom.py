@@ -23,90 +23,118 @@ class MocapPoseToOdom(Node):
     def __init__(self):
         super().__init__('mocap_to_odom')
         self.sub = self.create_subscription(
-            RigidBodies, 
-            'rigid_bodies',
-            self.callback,
-            10
-            )
-        
-        self.pub = self.create_publisher(
-            Odometry, 
-            'odom', 
+            RigidBodies,
+            '/rigid_bodies',
+            self.rigid_bodies_callback,
             10
         )
 
-        self.pose_buffer = deque(maxlen=MocapCfg.pose_buffer_n_arg)  
+        self.pub = self.create_publisher(
+            Odometry,
+            '/odom',
+            10
+        )
 
-    def callback(self, msg: RigidBodies):
-        self.pose_buffer.append(msg)
-        if len(self.pose_buffer) < 2:
+        self.pos_buffer = [deque(maxlen=MocapCfg.buffer_size) for _ in range(3)]
+        self.quat_buffer = [deque(maxlen=MocapCfg.buffer_size) for _ in range(4)]
+
+        self.t_prev = None
+        self.p_prev_filt = None
+        self.q_prev_filt = None
+
+    def rigid_bodies_callback(self, msg: RigidBodies):
+
+        if not msg.rigidbodies:
             return
 
-        first = self.pose_buffer[0]
-        last  = self.pose_buffer[-1]
+        rb = msg.rigidbodies[0]
+        t = self.get_clock().now().nanoseconds * 1e-9
 
-        dt = (last.header.stamp.sec - first.header.stamp.sec) + \
-             (last.header.stamp.nanosec - first.header.stamp.nanosec) * 1e-9
+        ### Position
+        p = np.array([
+            rb.pose.position.x,
+            rb.pose.position.y,
+            rb.pose.position.z,
+        ], dtype=float)
+
+        for i in range(3):
+            self.pos_buffer[i].append(p[i])
+
+        p_filt = np.array([np.mean(self.pos_buffer[i]) for i in range(3)], dtype=float)
+
+        ### Rotation
+        q = np.array([
+            rb.pose.orientation.x,
+            rb.pose.orientation.y,
+            rb.pose.orientation.z,
+            rb.pose.orientation.w,
+        ], dtype=float)
+
+        q = safe_quat(q)
+        if q is None:
+            return
+
+        if self.q_prev_filt is not None:
+            if np.dot(self.q_prev_filt, q) < 0:
+                q = -q
+
+        for i in range(4):
+            self.quat_buffer[i].append(q[i])
+
+        q_filt = np.array([np.mean(self.quat_buffer[i]) for i in range(4)], dtype=float)
+        q_filt = safe_quat(q_filt)
+        
+        if self.t_prev is None:
+            self.t_prev = t
+            self.p_prev_filt = p_filt
+            self.q_prev_filt = q_filt
+            return
+
+        ### Elapsed time
+        dt = t - self.t_prev
         
         if dt <= 0.0:
-            return
+            raise ValueError(f"dt must be > 0, got {dt}")
 
-        p1 = np.array([
-            first.rigidbodies[0].pose.position.x,
-            first.rigidbodies[0].pose.position.y, 
-            first.rigidbodies[0].pose.position.z
-            ])
-        
-        p2 = np.array([
-            last.rigidbodies[0].pose.position.x,
-            last.rigidbodies[0].pose.position.y,
-            last.rigidbodies[0].pose.position.z
-            ])
-        
-        v  = (p2 - p1) / dt
+        ### Velocity  
+        v = (p_filt - self.p_prev_filt) / dt
 
-        q1 = [
-            first.rigidbodies[0].pose.orientation.x,
-            first.rigidbodies[0].pose.orientation.y,
-            first.rigidbodies[0].pose.orientation.z,
-            first.rigidbodies[0].pose.orientation.w
-            ]
-        
-        q2 = [
-            last.rigidbodies[0].pose.orientation.x,
-            last.rigidbodies[0].pose.orientation.y, 
-            last.rigidbodies[0].pose.orientation.z,
-            last.rigidbodies[0].pose.orientation.w
-            ]
-        
-        
-        q1 = safe_quat(q1)
-        q2 = safe_quat(q2)
-        
-        if q1 is None or q2 is None:
-            return
-        
-        if np.dot(q1, q2) < 0:
-            q2 = -q2
+        q_prev = self.q_prev_filt
 
-        r1 = R.from_quat(q1)
-        r2 = R.from_quat(q2)
-        dq = r2 * r1.inv()         
-        rotvec = dq.as_rotvec()     
-        omega  = rotvec / dt        
-        
+        rotation_prev = R.from_quat(q_prev)
+        rotation_curr = R.from_quat(q_filt)
+
+        relative_rotation = rotation_curr * rotation_prev.inv()
+        relative_rotvec = relative_rotation.as_rotvec()
+        angular_velocity = relative_rotvec / dt
+
+        ### Odom Message
         odom = Odometry()
         odom.header = msg.header
         odom.header.frame_id = MocapCfg.frame
         odom.child_frame_id = 'base_link'
-        odom.pose.pose = msg.rigidbodies[0].pose
 
-        odom.twist.twist.linear.x  = float(v[0])
-        odom.twist.twist.linear.y  = float(v[1])
-        odom.twist.twist.linear.z  = float(v[2])
-        odom.twist.twist.angular.x = float(omega[0])
-        odom.twist.twist.angular.y = float(omega[1])
-        odom.twist.twist.angular.z = float(omega[2])
+        odom.pose.pose = rb.pose
+        odom.pose.pose.position.x = float(p_filt[0])
+        odom.pose.pose.position.y = float(p_filt[1])
+        odom.pose.pose.position.z = float(p_filt[2])
+
+        odom.pose.pose.orientation.x = float(q_filt[0])
+        odom.pose.pose.orientation.y = float(q_filt[1])
+        odom.pose.pose.orientation.z = float(q_filt[2])
+        odom.pose.pose.orientation.w = float(q_filt[3])
+
+        odom.twist.twist.linear.x = float(v[0])
+        odom.twist.twist.linear.y = float(v[1])
+        odom.twist.twist.linear.z = float(v[2])
+
+        odom.twist.twist.angular.x = float(angular_velocity[0])
+        odom.twist.twist.angular.y = float(angular_velocity[1])
+        odom.twist.twist.angular.z = float(angular_velocity[2])
+
+        self.t_prev = t
+        self.p_prev_filt = p_filt
+        self.q_prev_filt = q_filt
 
         self.pub.publish(odom)
 
