@@ -11,6 +11,10 @@ import argparse
 from .config import MocapCfg
 
 
+from scipy.signal import butter, sosfilt, sosfilt_zi
+
+
+
 def safe_quat(q):
     q = np.array(q, dtype=float)
     if not np.all(np.isfinite(q)):
@@ -36,13 +40,33 @@ class MocapPoseToOdom(Node):
             10
         )
 
-        ### Position and rotation median filter
+        ### Position and rotation moving average filter 
         self.pos_buffer = [deque(maxlen=MocapCfg.buffer_size) for _ in range(3)]
         self.quat_buffer = [deque(maxlen=MocapCfg.buffer_size) for _ in range(4)]
 
         self.t_prev = None
         self.p_prev_filt = None
         self.q_prev_filt = None
+        
+        ### Linear and angular velocity low pass filter 
+        self.vel_sos = butter(
+            MocapCfg.lpf_order, 
+            MocapCfg.lpf_cutoff_hz, 
+            btype="low", 
+            fs=MocapCfg.mocap_rate_hz, 
+            output="sos"
+        )
+        self.vel_zi = np.repeat(sosfilt_zi(self.vel_sos)[:, :, None], 3, axis=2) * 0.0
+        
+        self.ang_sos = butter(
+            MocapCfg.lpf_order, 
+            MocapCfg.lpf_cutoff_hz, 
+            btype="low", 
+            fs=MocapCfg.mocap_rate_hz, 
+            output="sos"
+        )
+        self.ang_zi = np.repeat(sosfilt_zi(self.ang_sos)[:, :, None], 3, axis=2) * 0.0
+                
 
     def rigid_bodies_callback(self, msg: RigidBodies):
 
@@ -85,9 +109,7 @@ class MocapPoseToOdom(Node):
 
         q_filt = np.array([np.median(self.quat_buffer[i]) for i in range(4)], dtype=float)
         q_filt = safe_quat(q_filt)
-        if q_filt is None:
-            return
-
+        
         if self.t_prev is None:
             self.t_prev = t
             self.p_prev_filt = p_filt
@@ -96,20 +118,25 @@ class MocapPoseToOdom(Node):
 
         ### Elapsed time
         dt = t - self.t_prev
+        
         if dt <= 0.0:
             raise ValueError(f"dt must be > 0, got {dt}")
 
-        ### Velocity 
+        ### Velocity  
         v = (p_filt - self.p_prev_filt) / dt
+        
+        v, self.vel_zi = (lambda y: (y[0][0], y[1]))(sosfilt(self.vel_sos, v[None, :], axis=0, zi=self.vel_zi))
 
         q_prev = self.q_prev_filt
+
         rotation_prev = R.from_quat(q_prev)
         rotation_curr = R.from_quat(q_filt)
 
         relative_rotation = rotation_curr * rotation_prev.inv()
         relative_rotvec = relative_rotation.as_rotvec()
-        angular_velocity = relative_rotvec / dt  
-
+        angular_velocity = relative_rotvec / dt
+        angular_velocity, self.ang_zi = (lambda y: (y[0][0], y[1]))(sosfilt(self.ang_sos, angular_velocity[None, :], axis=0, zi=self.ang_zi))
+        
         ### Odom Message
         odom = Odometry()
         odom.header = msg.header
